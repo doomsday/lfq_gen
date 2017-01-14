@@ -43,8 +43,6 @@ private:
 	std::atomic<counted_node_ptr> head;
 	std::atomic<counted_node_ptr> tail;	// 1
 
-
-
 public:
 	void push(T new_value) {
 
