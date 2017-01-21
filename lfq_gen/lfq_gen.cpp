@@ -22,20 +22,20 @@ private:
 		// Keeping the structure within a machine word makes it more likely
 		// that the atomic operations can be lock-free on many platforms
 		unsigned internal_count:30;
-		unsigned external_counters:2;	// 2
+		unsigned external_counters:2;
 	};
 
 	struct node
 	{
 		std::atomic<T*> data;
-		std::atomic<node_counter> count;	// 3
-		counted_node_ptr next;
+		std::atomic<node_counter> count;
+		std::atomic<counted_node_ptr> next;	// 1
 
 		node() {
 			node_counter new_count;
 			new_count.internal_count = 0;
 			// queue's own counters: only head and tail (max = 2)
-			new_count.external_counters = 2;	// 4
+			new_count.external_counters = 2;
 			count.store(new_count);
 
 			next.ptr = nullptr;
@@ -43,19 +43,20 @@ private:
 		}
 
 		/**
-		* Decreases this node's internal_count and deletes useless node */
+		* Decreases this node's internal_count and deletes useless node.
+		* Release the single reference held by this thread */
 		void release_ref() {
 			node_counter old_counter = count.load(std::memory_order_relaxed);
 			node_counter new_counter;
 
 			do {
 				new_counter = old_counter;
-				--new_counter.internal_count;	// 1
-			} while (!count.compare_exchange_strong(old_counter, new_counter,	// 2
+				--new_counter.internal_count;
+			} while (!count.compare_exchange_strong(old_counter, new_counter,
 				std::memory_order_acquire, std::memory_order_relaxed));
 
 			if (!new_counter.internal_count && !new_counter.external_counters) {
-				delete this;	// 3
+				delete this;
 			}
 		}
 
@@ -94,20 +95,35 @@ private:
 			node_counter new_counter;
 			do {
 				new_counter = old_counter;
-				--new_counter.external_counters;	// 1
-				new_counter.internal_count += count_increase;	// 2
-			} while (!ptr->count.compare_exchange_strong(old_counter, new_counter,	// 3
+				--new_counter.external_counters;
+				new_counter.internal_count += count_increase;
+			} while (!ptr->count.compare_exchange_strong(old_counter, new_counter,
 				std::memory_order_acquire, std::memory_order_relaxed));
 
 			// delete node if all counters became 0
 			if (!new_counter.internal_counter && !new_counter.external_counters) {
-				delete ptr;	// 4
+				delete ptr;
 			}
 		};
+
+		void set_new_tail(counted_node_ptr& old_tail, counted_node_ptr const& new_tail) {	// 1
+			node* const current_tail_ptr = old_tail.ptr;
+
+			// if another thread updated tail -> check that new tail pointer to node is the same as
+			// it was before loop -> break if not the same
+			while (!tail.compare_exchange_weak(old_tail, new_tail) && old_tail.ptr == current_tail_ptr);	// 2
+
+			if (old_tail.ptr == current_tail_ptr)	// 3
+			// ptr is the same once the loop has exited, successfully set the tail
+				free_external_count(old_tail);	// 4
+			else
+			// another thread will have freed the counter, release the single reference held by this thread
+				current_tail_ptr->release_ref();	// 5
+		}
 	};
 
 	std::atomic<counted_node_ptr> head;
-	std::atomic<counted_node_ptr> tail;	// 1
+	std::atomic<counted_node_ptr> tail;
 
 public:
 	/**
@@ -121,47 +137,60 @@ public:
 		counted_node_ptr old_tail = tail.load();
 
 		for (;;) {
-			increase_external_count(tail, old_tail);	// 5
+			increase_external_count(tail, old_tail);
 
 			T* old_data = nullptr;
-			// no other thread can modify tail while data is not nullptr
+
 			if (old_tail.ptr->data.compare_exchange_strong(old_data, new_data.get()))	// 6
 			{
-				old_tail.ptr->next = new_next;
-				old_tail = tail.exchange(new_next);
-				// now node is fully pushed (data is nullptr), so other threads
-				// can proceed with their pushes
-				free_external_counter(old_tail);	// 7
+			// successfully set the tail's node's data pointer to 'new_data' because it was 'nullptr'
+				counted_node_ptr old_next = { 0 };
+				if (!old_tail.ptr->next.compare_exchange_strong(old_next, new_next)) {	// 7
+				// another thread has already helped this thread and set the next pointer in step 10
+					delete new_next.ptr;	// 8: don't need the new empty node, delete it
+					new_next = old_next;	// 9: use the next value that the other thread set for updating tail
+				}
+				set_new_tail(old_tail, new_next);
 				new_data.release();
 				break;
 			}
-			old_tail.ptr->release_ref(); //
+			else {	// 10: help the successful thread to complete the update: set 'next' and 'tail'
+			// the tail's node's data pointer was not 'nullptr'
+				counted_node_ptr old_next = { 0 };
+				if (old_tail.ptr->next.compare_exchange_strong(old_next, new_next)) {	// 11
+					old_next = new_next;	// 12
+					new_next.ptr = new node;	// 13
+				}
+				set_new_tail(old_tail, old_next);	// 14
+			}
 		}
 	}
 
 	/**
 	* Pops node from the queue */
 	std::unique_ptr<T> pop() {
-		counted_node_ptr old_head = head.load(std::memory_order_relaxed);	// 1
+		counted_node_ptr old_head = head.load(std::memory_order_relaxed);
 
 		for (;;) {
-			increase_external_count(head, old_head);	// 2
+			increase_external_count(head, old_head);
 			node* const ptr = old_head.ptr;
 
-			// if queue is empty ('ptr' is null)
+			/* if head's counted_node_ptr's ptr points to the same node as tail
+			// it means that the queue is empty so return new empty unique_ptr */
 			if (ptr == tail.load().ptr) {
-				prt->release_ref();		// 3
+				prt->release_ref();
 				return std::unique_ptr<T>();
 			}
 
+			counted_node_ptr next = ptr->next.load();	// 2
 			// this compares the external count and pointer as a single entity
-			if (head.compare_exchange_strong(old_head, ptr->next)) {	// 4
+			if (head.compare_exchange_strong(old_head, next)) {
 				T* const res = ptr->data.exchange(nullptr);
-				free_external_count(old_head);	// 5
+				free_external_count(old_head);
 				return std::unique_ptr<T>(res);
 			}
 
-			ptr->release_ref;	// 6
+			ptr->release_ref;
 		}
 	}
 };
@@ -169,6 +198,9 @@ public:
 
 int main()
 {
+	lock_free_queue<int>* lfq = new lock_free_queue<int>();
+	lfq->push(5);
+
 	return 0;
 }
 
